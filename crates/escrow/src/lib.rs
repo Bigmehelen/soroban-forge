@@ -803,7 +803,8 @@ impl Escrow {
         }
         escrow.arbiter.require_auth();
 
-        let (seller_share, buyer_share) = split_amount(escrow.amount, seller_bps)?;
+        let remaining = escrow.remaining();
+        let (seller_share, buyer_share) = split_amount(remaining, seller_bps)?;
         let mut resolved = escrow;
 
         if seller_share > 0 {
@@ -813,6 +814,7 @@ impl Escrow {
             transfer_from_contract(&env, &resolved.token, &resolved.buyer, buyer_share)?;
         }
 
+        resolved.released = resolved.amount;
         resolved.status = if seller_share == 0 {
             EscrowStatus::Refunded
         } else {
@@ -1015,6 +1017,31 @@ fn transfer_from_contract(
         Ok(Ok(())) => Ok(()),
         _ => Err(ForgeError::TokenTransferFailed),
     }
+}
+
+/// Split a non-negative amount by basis points without overflowing an
+/// intermediate `amount * seller_bps` multiplication.
+fn split_amount(amount: i128, seller_bps: u32) -> Result<(i128, i128), ForgeError> {
+    let denominator = 10_000_i128;
+    let seller_bps = i128::from(seller_bps);
+    let whole = amount
+        .checked_div(denominator)
+        .ok_or(ForgeError::ArithmeticOverflow)?;
+    let remainder = amount
+        .checked_rem(denominator)
+        .ok_or(ForgeError::ArithmeticOverflow)?;
+    let seller_share = whole
+        .checked_mul(seller_bps)
+        .and_then(|value| {
+            remainder
+                .checked_mul(seller_bps)
+                .and_then(|fraction| value.checked_add(fraction / denominator))
+        })
+        .ok_or(ForgeError::ArithmeticOverflow)?;
+    let buyer_share = amount
+        .checked_sub(seller_share)
+        .ok_or(ForgeError::ArithmeticOverflow)?;
+    Ok((seller_share, buyer_share))
 }
 
 /// Bump a persistent entry's TTL to the [`ttl::BUMP_AMOUNT`] horizon when

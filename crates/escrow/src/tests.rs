@@ -434,6 +434,24 @@ fn resolve_split_rejects_invalid_basis_points() {
     assert_eq!(client.get_status(&id), EscrowStatus::Disputed);
 }
 
+#[test]
+fn resolve_split_uses_only_the_balance_remaining_after_partial_release() {
+    let (_env, token, tc, contract_id, client, accounts) = setup!();
+    let (buyer, seller, arbiter) = parties(&accounts);
+    let id = create(&client, &token, buyer, seller, arbiter, TIMEOUT);
+    client.deposit(&id);
+    client.release_partial(&id, &200);
+    client.dispute(&id, buyer);
+
+    client.resolve_split(&id, &5000);
+
+    assert_eq!(tc.balance(seller), 600);
+    assert_eq!(tc.balance(buyer), 400);
+    assert_eq!(tc.balance(&contract_id), 0);
+    assert_eq!(client.get_status(&id), EscrowStatus::Completed);
+    assert_eq!(client.get_escrow(&id).released, AMOUNT);
+}
+
 // -----------------------------------------------------------------------
 // Cancel
 // -----------------------------------------------------------------------
