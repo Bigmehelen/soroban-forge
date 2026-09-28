@@ -2,7 +2,8 @@
 //!
 //! Authorization model:
 //! - `set_royalty` requires the collection.
-//! - `distribute` requires the collection.
+//! - `distribute` requires the collection and the payer (the payer's
+//!   authorization covers the nested royalty transfer to the recipient).
 //! - `settle_sale` requires the collection and the payer.
 
 use crate::{MarketplaceRoyalties, SorobanForgeMarketplaceRoyaltiesClient};
@@ -100,23 +101,43 @@ fn set_royalty_rejects_signature_from_non_collection() {
 }
 
 #[test]
-fn distribute_accepts_collection_signature() {
-    let (env, _token, contract_id, client, collection, recipient, seller, _payer) = setup!();
+fn distribute_accepts_collection_and_payer_signatures() {
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
 
     client.set_royalty(&collection, &recipient, &BPS);
 
-    env.mock_auths(&[MockAuth {
-        address: &collection,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "distribute",
-            args: (&collection, &seller, AMOUNT).into_val(&env),
-            sub_invokes: &[],
+    // Two frames: the collection authorizes the entrypoint, and the payer
+    // authorizes the entrypoint — its frame also carries the nested royalty
+    // transfer to the recipient (50 = 5% of 1_000) as a sub-invocation,
+    // exactly as escrow's deposit carries its nested SAC transfer.
+    env.mock_auths(&[
+        MockAuth {
+            address: &collection,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
         },
-    }]);
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &token,
+                    fn_name: "transfer",
+                    args: (&payer, &recipient, 50_i128).into_val(&env),
+                    sub_invokes: &[],
+                }],
+            },
+        },
+    ]);
 
     let net = client
-        .try_distribute(&collection, &seller, &AMOUNT)
+        .try_distribute(&collection, &token, &payer, &seller, &AMOUNT)
         .expect("outer ok")
         .unwrap();
     assert_eq!(net, 950);
@@ -124,21 +145,347 @@ fn distribute_accepts_collection_signature() {
 
 #[test]
 fn distribute_rejects_seller_signature() {
-    let (env, _token, contract_id, client, collection, recipient, seller, _payer) = setup!();
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
 
     client.set_royalty(&collection, &recipient, &BPS);
 
-    // Seller trying to authorize distribute instead of collection
+    // Seller trying to authorize distribute instead of collection. The
+    // payer's entrypoint frame still carries the nested token transfer, so
+    // only the seller's wrongful collection-frame triggers the abort.
+    env.mock_auths(&[
+        MockAuth {
+            address: &seller,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[MockAuthInvoke {
+                    contract: &token,
+                    fn_name: "transfer",
+                    args: (&payer, &recipient, 50_i128).into_val(&env),
+                    sub_invokes: &[],
+                }],
+            },
+        },
+    ]);
+
+    let res = client.try_distribute(&collection, &token, &payer, &seller, &AMOUNT);
+    assert_auth_abort!(res);
+}
+
+#[test]
+fn distribute_rejects_payer_signature_without_token_authorization() {
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+
+    client.set_royalty(&collection, &recipient, &BPS);
+
+    // Only the entrypoint frames are armed; the nested SAC transfer pull
+    // has no authorization. Funds must not move on entrypoint signatures
+    // alone.
+    env.mock_auths(&[
+        MockAuth {
+            address: &collection,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "distribute",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    // The unmatched nested auth is not a root abort: the SAC rejects the
+    // pull and the contract buckets the token error.
+    let res = client.try_distribute(&collection, &token, &payer, &seller, &AMOUNT);
+    assert!(matches!(
+        res,
+        Err(Ok(
+            soroban_forge_shared_utils::ForgeError::TokenTransferFailed
+        ))
+    ));
+}
+
+#[test]
+fn settle_sale_accepts_collection_and_payer_signatures_and_records_auth_tree() {
+    use soroban_sdk::token::StellarAssetClient as TokenAdminClient;
+
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+    client.set_royalty(&collection, &recipient, &BPS);
+
+    env.mock_all_auths();
+    let token_admin = TokenAdminClient::new(&env, &token);
+    token_admin.mint(&payer, &(AMOUNT * 10));
+
+    let expected_royalty = AMOUNT * (BPS as i128) / 10_000;
+    let expected_seller_net = AMOUNT - expected_royalty;
+
+    let transfer_sub_invokes = [
+        MockAuthInvoke {
+            contract: &token,
+            fn_name: "transfer",
+            args: (&payer, &seller, expected_seller_net).into_val(&env),
+            sub_invokes: &[],
+        },
+        MockAuthInvoke {
+            contract: &token,
+            fn_name: "transfer",
+            args: (&payer, &recipient, expected_royalty).into_val(&env),
+            sub_invokes: &[],
+        },
+    ];
+
+    env.mock_auths(&[
+        MockAuth {
+            address: &collection,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "settle_sale",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "settle_sale",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &transfer_sub_invokes,
+            },
+        },
+    ]);
+
+    let res = client
+        .try_settle_sale(&collection, &token, &payer, &seller, &AMOUNT)
+        .expect("outer ok")
+        .expect("contract ok");
+
+    assert_eq!(res.seller_net + res.royalty_share, AMOUNT);
+    assert!(!env.auths().is_empty(), "expected auth tree records");
+}
+
+#[test]
+fn settle_sale_rejects_missing_collection_signature() {
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+    client.set_royalty(&collection, &recipient, &BPS);
+
     env.mock_auths(&[MockAuth {
-        address: &seller,
+        address: &payer,
         invoke: &MockAuthInvoke {
             contract: &contract_id,
-            fn_name: "distribute",
-            args: (&collection, &seller, AMOUNT).into_val(&env),
+            fn_name: "settle_sale",
+            args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
             sub_invokes: &[],
         },
     }]);
 
-    let res = client.try_distribute(&collection, &seller, &AMOUNT);
+    let res = client.try_settle_sale(&collection, &token, &payer, &seller, &AMOUNT);
     assert_auth_abort!(res);
+}
+
+#[test]
+fn settle_sale_rejects_missing_payer_signature() {
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+    client.set_royalty(&collection, &recipient, &BPS);
+
+    env.mock_auths(&[MockAuth {
+        address: &collection,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "settle_sale",
+            args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_settle_sale(&collection, &token, &payer, &seller, &AMOUNT);
+    assert_auth_abort!(res);
+}
+
+#[test]
+fn settle_sale_rejects_non_party_signature_in_place_of_payer() {
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+    client.set_royalty(&collection, &recipient, &BPS);
+
+    env.mock_auths(&[
+        MockAuth {
+            address: &collection,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "settle_sale",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &seller,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "settle_sale",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    let res = client.try_settle_sale(&collection, &token, &payer, &seller, &AMOUNT);
+    assert_auth_abort!(res);
+}
+
+#[test]
+fn settle_sale_rejects_replayed_signature_with_altered_args() {
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+    client.set_royalty(&collection, &recipient, &BPS);
+
+    let altered_amount = AMOUNT * 2;
+
+    env.mock_auths(&[
+        MockAuth {
+            address: &collection,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "settle_sale",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "settle_sale",
+                args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    let res = client.try_settle_sale(&collection, &token, &payer, &seller, &altered_amount);
+    assert_auth_abort!(res);
+}
+
+#[test]
+fn settle_sales_accepts_valid_batch_and_records_auth_tree() {
+    use soroban_sdk::token::StellarAssetClient as TokenAdminClient;
+    use soroban_sdk::vec;
+
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+    client.set_royalty(&collection, &recipient, &BPS);
+
+    env.mock_all_auths();
+    let token_admin = TokenAdminClient::new(&env, &token);
+    token_admin.mint(&payer, &(AMOUNT * 10));
+
+    let expected_royalty = AMOUNT * (BPS as i128) / 10_000;
+    let expected_seller_net = AMOUNT - expected_royalty;
+
+    let sales = vec![&env, (seller.clone(), AMOUNT), (seller.clone(), AMOUNT)];
+
+    let batch_sub_invokes = [
+        MockAuthInvoke {
+            contract: &token,
+            fn_name: "transfer",
+            args: (&payer, &seller, expected_seller_net).into_val(&env),
+            sub_invokes: &[],
+        },
+        MockAuthInvoke {
+            contract: &token,
+            fn_name: "transfer",
+            args: (&payer, &recipient, expected_royalty).into_val(&env),
+            sub_invokes: &[],
+        },
+        MockAuthInvoke {
+            contract: &token,
+            fn_name: "transfer",
+            args: (&payer, &seller, expected_seller_net).into_val(&env),
+            sub_invokes: &[],
+        },
+        MockAuthInvoke {
+            contract: &token,
+            fn_name: "transfer",
+            args: (&payer, &recipient, expected_royalty).into_val(&env),
+            sub_invokes: &[],
+        },
+    ];
+
+    env.mock_auths(&[
+        MockAuth {
+            address: &collection,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "settle_sales",
+                args: (&collection, &token, &payer, sales.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &payer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "settle_sales",
+                args: (&collection, &token, &payer, sales.clone()).into_val(&env),
+                sub_invokes: &batch_sub_invokes,
+            },
+        },
+    ]);
+
+    let settlements = client
+        .try_settle_sales(&collection, &token, &payer, &sales)
+        .expect("outer ok")
+        .expect("contract ok");
+
+    assert_eq!(settlements.len(), 2);
+    assert!(!env.auths().is_empty());
+}
+
+#[test]
+fn settle_sales_auth_failure_leaves_summary_and_balances_untouched() {
+    use soroban_sdk::token::Client as TokenClient;
+    use soroban_sdk::vec;
+
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
+    client.set_royalty(&collection, &recipient, &BPS);
+
+    let token_client = TokenClient::new(&env, &token);
+    let initial_payer_balance = token_client.balance(&payer);
+    let initial_summary = client.try_get_settlement_summary(&collection);
+
+    let sales = vec![&env, (seller.clone(), AMOUNT), (seller.clone(), AMOUNT)];
+
+    env.mock_auths(&[MockAuth {
+        address: &payer,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "settle_sales",
+            args: (&collection, &token, &payer, sales.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_settle_sales(&collection, &token, &payer, &sales);
+    assert_auth_abort!(res);
+
+    assert_eq!(token_client.balance(&payer), initial_payer_balance);
+    assert_eq!(
+        client.try_get_settlement_summary(&collection),
+        initial_summary
+    );
 }
